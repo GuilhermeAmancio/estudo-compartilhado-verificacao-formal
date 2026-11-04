@@ -1,0 +1,2 @@
+# estudo-compartilhado-verificacao-formal
+😪
