@@ -12,12 +12,18 @@ Local Open Scope hmap_scope.
 
 (*! State monad with failures *)
 
+(* [sf sty fty] is the result of a computation that either succeeds with
+    a value of type [sty] ([Sret]) or fails with a reason of type [fty]
+    ([Fail]). Note that the monad itself does not thread any state: it is
+    the usual Result/Either monad. *)
 Inductive sf (sty fty: Type) :=
-| Sret: sty -> sf sty fty
-| Fail: fty -> sf sty fty.
+| Sret: sty -> sf sty fty (* success, carrying the result *)
+| Fail: fty -> sf sty fty. (* failure, carrying the reason *)
 Arguments Sret [_] {_}.
 Arguments Fail {_} [_].
 
+(* Lift an [option] into [sf]: [Some s] becomes [Sret s], and [None]
+    becomes [Fail f]. *)
 Definition liftToSF {sty fty} (os: option sty) (f: fty): sf sty fty :=
   match os with
   | Some s => Sret s
@@ -28,24 +34,32 @@ Declare Scope sf_monad_scope.
 
 Module SFMonadNotations.
 
+    (* Bind: if [SF] succeeds with [s], run [CONT] with [S := s];
+      if it fails, propagate the failure and skip [CONT]. *)
   Notation "S <- SF ; CONT" :=
     (match SF with
      | Sret s => (fun S => CONT) s
      | Fail f => Fail f
      end) (at level 84, right associativity): sf_monad_scope.
-
+    
+    (* Bind with recovery: if [SF] fails, ignore the failure and run
+      [CONT] with [S := AS] (a default value) instead. *)
   Notation "S <- SF <~ AS ; CONT" :=
     (match SF with
      | Sret s => (fun S => CONT) s
      | Fail f => (fun S => CONT) AS
      end) (at level 84, right associativity): sf_monad_scope.
-
+    
+  (* Bind with early exit: if [SF] fails, stop and return [Sret RET]
+      without running [CONT]. *)    
   Notation "S <- SF ~> RET ; CONT" :=
     (match SF with
      | Sret s => (fun S => CONT) s
      | Fail _ => Sret RET
      end) (at level 84, right associativity): sf_monad_scope.
-
+     
+  (* [OS |> F] is [liftToSF OS F]: turn an [option] into an [sf], using
+      [F] as the failure reason when it is [None]. *)
   Notation "OS |> F" :=
     (liftToSF OS F) (at level 83, left associativity): sf_monad_scope.
 
@@ -56,7 +70,16 @@ Include SFMonadNotations.
 
 Section ListMap.
   Context {A S F: Type}.
+  (* The function applied to each element; it may fail with a reason of type [F]. *)
   Variable (f: A -> sf S F).
+  
+   (* Monadic map over a list ([mapM]). Applies [f] to the elements from left
+      to right and collects the results in order.
+      - If every call succeeds, the result is [Sret] of the list of results.
+      - If some call fails, the whole computation fails with the reason of the
+        first (leftmost) failure; the remaining elements are not processed.
+      Outside this section, [f] is the first explicit argument:
+      [sf_list_map f al]. *)
   Fixpoint sf_list_map (al: list A): sf (list S) F :=
     match al with
     | nil => Sret nil
@@ -68,7 +91,17 @@ End ListMap.
 
 Section ListMap2.
   Context {A B S F: Type}.
+   (* The function applied to each pair of elements; it may fail with a
+      reason of type [F]. *)
   Variable (f: A -> B -> sf S F).
+  
+  (* Two-list version of [sf_list_map] (a monadic [zipWith]). Applies [f]
+      to the pairs [(a_i, b_i)] from left to right.
+      - If the lists have different lengths, it stops when the shorter one
+        ends and silently ignores the rest of the longer one (no failure).
+      - As in [sf_list_map], the first failing call aborts the whole
+        computation and its reason is returned.
+      Structural recursion is on [bl]. *)
   Fixpoint sf_list_map2 (al: list A) (bl: list B) {struct bl}: sf (list S) F :=
     match al with
     | nil => Sret nil
@@ -83,14 +116,23 @@ End ListMap2.
 
 Section Iterate.
   Context {T A F: Type}.
+  (* One step: given an element [t] and the current accumulator [a], compute
+      the next accumulator (or fail). *)
   Variable fitr: T -> A -> sf A F.
-
+  
+  (* Monadic left fold ([foldM]). Runs [fitr] over [ts] from left to right,
+      feeding each result as the accumulator of the next step.
+      - Empty list: returns the initial accumulator [a].
+      - If any step fails, the whole computation fails with that reason. *)
   Fixpoint iterate (ts: list T) (a: A): sf A F :=
     match ts with
     | nil => Sret a
     | cons t ts' => (ta <- fitr t a; iterate ts' ta)
     end.
-
+    
+  (* Same as [iterate], but a failing step is skipped: the failure reason is
+      discarded and the accumulator keeps its previous value [a] (see the
+      [<~] notation). Hence it never returns [Fail]. *)
   Fixpoint iterate_resume (ts: list T) (a: A): sf A F :=
     match ts with
     | nil => Sret a
@@ -102,10 +144,30 @@ End Iterate.
 
 Section IterateUpd.
   Context {T A B F: Type}.
+  (* - [fitr]: runs one element [t] against the current state [a] and
+        produces a result [b] of type [B] (or fails).
+      - [fba]:  extracts from a result [b] the part that must be applied to
+        the current state, as a value of type [A].
+      - [nilb]: the neutral (empty) result, returned for an empty list.
+      - [upda]: updates a state with a new one: [upda a a'] is the state seen
+        by the next element.
+      - [updb]: combines two results: [updb b rest] merges the result of the
+        current element with the combined result of the remaining ones. *)
   Variables (fitr: T -> A -> sf B F)
             (fba: B -> A) (nilb: B)
             (upda: A -> A -> A) (updb: B -> B -> B).
 
+  (* Iterate over [ts] threading a state of type [A] while accumulating
+      results of type [B].
+      For each element [t]:
+      1. run [fitr t a] on the current state [a], obtaining [tab];
+      2. the next elements run on [upda a (fba tab)], i.e. they see the effect
+         of this element;
+      3. the final result is [updb tab (result of the rest)].
+      So the result of [t1; t2; ...; tn] is
+      [updb b1 (updb b2 (... (updb bn nilb)))], and each [t_i] runs on the
+      state updated by all the previous elements.
+      If any step fails, the whole computation fails with that reason. *)
   Fixpoint iterate_update (ts: list T) (a: A): sf B F :=
     match ts with
     | nil => Sret nilb
